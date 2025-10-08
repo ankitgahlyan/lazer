@@ -446,21 +446,50 @@
             userAddress: null,
 
             async init() {
-                this.tonConnectUI = new TON_CONNECT_UI.TonConnectUI({
+                // Support multiple bundle shapes: library might expose TonConnectUI as
+                // window.TON_CONNECT_UI.TonConnectUI or window.TonConnectUI
+                const TonConnectUIClass = (window.TON_CONNECT_UI && window.TON_CONNECT_UI.TonConnectUI) || window.TonConnectUI;
+                if (!TonConnectUIClass) {
+                    console.error('TonConnectUI not found on window. Make sure the tonconnect ui script is loaded.');
+                    this.showStatus('TonConnect UI not loaded', 'error');
+                    return;
+                }
+
+                this.tonConnectUI = new TonConnectUIClass({
                     manifestUrl: 'https://ankitgahlyan.github.io/lazer/tonconnect-manifest.json',
                     buttonRootId: 'tonconnect-button'
                 });
 
-                this.tonConnectUI.onStatusChange(wallet => {
-                    if (wallet) {
-                        this.onWalletConnected(wallet);
-                    } else {
-                        this.onWalletDisconnected();
-                    }
-                });
+                // Normalize the status change callback: different versions pass different shapes.
+                const handleStatus = (payload) => {
+                    console.debug('TonConnect status payload:', payload);
+                    // payload might be a wallet object, or { wallet } or [wallet]
+                    let wallet = null;
+                    if (!payload) wallet = null;
+                    else if (payload.wallet) wallet = payload.wallet;
+                    else if (payload.account) wallet = payload; // wallet-like
+                    else if (Array.isArray(payload) && payload.length) wallet = payload[0];
+                    else wallet = payload;
 
-                if (this.tonConnectUI.wallet) {
-                    this.onWalletConnected(this.tonConnectUI.wallet);
+                    if (wallet) this.onWalletConnected(wallet);
+                    else this.onWalletDisconnected();
+                };
+
+                // Hook into available API for status changes. Try common names.
+                if (typeof this.tonConnectUI.onStatusChange === 'function') {
+                    this.tonConnectUI.onStatusChange(handleStatus);
+                } else if (typeof this.tonConnectUI.on === 'function') {
+                    // event emitter style
+                    this.tonConnectUI.on('statusChange', handleStatus);
+                } else {
+                    console.warn('No status change hook found on TonConnectUI instance.');
+                }
+
+                // If a wallet is already connected, try to use it. Support several property names.
+                const existing = this.tonConnectUI.wallet || this.tonConnectUI.connectedWallet || this.tonConnectUI.account || null;
+                if (existing) {
+                    console.debug('Existing wallet found on init:', existing);
+                    handleStatus(existing);
                 }
             },
 
@@ -468,7 +497,9 @@
                 document.getElementById('connectSection').classList.add('hidden');
                 document.getElementById('walletInfo').classList.remove('hidden');
                 document.getElementById('transferSection').classList.remove('hidden');
-                this.userAddress = wallet.account.address;
+                // Normalize wallet/address shapes from different versions/providers
+                console.debug('onWalletConnected received:', wallet);
+                this.userAddress = wallet?.account?.address || wallet?.address || wallet?.permissions?.account?.address || wallet?.wallet?.address || null;
                 document.getElementById('userAddress').textContent = this.formatAddress(this.userAddress);
                 await this.fetchJettonWalletAddress();
             },
@@ -485,7 +516,7 @@
             },
 
             async fetchJettonWalletAddress() {
-                if (!this.minterAddress || this.minterAddress === 'EQC...') {
+                if (!this.minterAddress) {
                     this.showStatus('Please configure minter address', 'error');
                     return;
                 }
@@ -501,10 +532,16 @@
                         })
                     });
                     const data = await response.json();
-                    if (data.ok && data.result.exit_code === 0) {
+                    console.debug('get_wallet_address response', data);
+                    if (data.ok && data.result && data.result.exit_code === 0 && Array.isArray(data.result.stack) && data.result.stack.length) {
+                        // stack[0] might be like ['tvm.Slice', '0x...'] or ['cell', 'te6...'] or ['addr','0:...']
                         this.jettonWalletAddress = this.parseAddress(data.result.stack[0]);
-                        document.getElementById('jettonWalletAddr').textContent = this.formatAddress(this.jettonWalletAddress);
-                        await this.refreshBalance();
+                        if (this.jettonWalletAddress) {
+                            document.getElementById('jettonWalletAddr').textContent = this.formatAddress(this.jettonWalletAddress);
+                            await this.refreshBalance();
+                        } else {
+                            throw new Error('Could not parse jetton wallet address from contract response');
+                        }
                     } else {
                         throw new Error('Failed to fetch wallet address');
                     }
@@ -527,10 +564,22 @@
                         })
                     });
                     const data = await response.json();
-                    if (data.ok && data.result.exit_code === 0) {
-                        const balance = BigInt('0x' + data.result.stack[0][1]);
+                    console.debug('get_wallet_data response', data);
+                    if (data.ok && data.result && data.result.exit_code === 0 && Array.isArray(data.result.stack) && data.result.stack.length) {
+                        const stack0 = data.result.stack[0];
+                        let raw = stack0[1];
+                        // raw might already be hex without 0x, or decimal string. Try to handle both.
+                        if (typeof raw === 'string' && raw.startsWith('0x')) raw = raw.slice(2);
+                        let balance = BigInt(0);
+                        try {
+                            balance = BigInt('0x' + raw);
+                        } catch (e) {
+                            try { balance = BigInt(raw); } catch (e2) { balance = BigInt(0); }
+                        }
                         document.getElementById('jettonBalance').textContent = (Number(balance) / 1e9).toFixed(2);
                         this.showStatus('Balance updated!', 'success');
+                    } else {
+                        this.showStatus('Could not read balance', 'error');
                     }
                 } catch (error) {
                     this.showStatus('Error: ' + error.message, 'error');
@@ -549,7 +598,17 @@
                     btn.disabled = true;
                     btn.innerHTML = 'Processing<span class="spinner"></span>';
                     const payload = this.buildTransferPayload(recipient, amount);
-                    await this.tonConnectUI.sendTransaction({
+                    // Support different shapes of TonConnectUI/connector APIs
+                    const sendTx = this.tonConnectUI.sendTransaction?.bind(this.tonConnectUI)
+                        || this.tonConnectUI.tonconnect?.sendTransaction?.bind(this.tonConnectUI.tonconnect)
+                        || this.tonConnectUI.connector?.sendTransaction?.bind(this.tonConnectUI.connector)
+                        || this.tonConnectUI.tonConnect?.sendTransaction?.bind(this.tonConnectUI.tonConnect);
+                    if (!sendTx) {
+                        console.error('No sendTransaction function found on tonConnect UI instance', this.tonConnectUI);
+                        throw new Error('Wallet send function not available');
+                    }
+
+                    await sendTx({
                         validUntil: Math.floor(Date.now() / 1000) + 360,
                         messages: [{
                             address: this.jettonWalletAddress,
@@ -585,7 +644,21 @@
             },
 
             parseAddress(addrCell) {
-                return addrCell[0] === 'tvm.Slice' ? addrCell[1] : addrCell[1];
+                // addrCell may be like ['tvm.Slice', '0x...'] or ['addr', '0:...'] or ['cell', 'te6...']
+                try {
+                    if (!addrCell) return null;
+                    if (Array.isArray(addrCell)) {
+                        const [, val] = addrCell;
+                        if (!val) return null;
+                        // If it's a hex string starting with 0x, convert to classic raw address if needed
+                        if (typeof val === 'string') return val;
+                        return String(val);
+                    }
+                    return String(addrCell);
+                } catch (e) {
+                    console.warn('Failed to parse addrCell', addrCell, e);
+                    return null;
+                }
             },
 
             formatAddress(address) {
